@@ -1,0 +1,834 @@
+#include <iostream>
+#include <string>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <stdexcept> 
+
+#include <filesystem> 
+namespace fs = std::filesystem;
+
+// --- Утилита для очистки строк (удаление пробелов, табуляции, перевода строки) ---
+std::string trim(const std::string& str) {
+    size_t first = str.find_first_not_of(" \t\n\r");
+    if (std::string::npos == first) {
+        return "";
+    }
+    size_t last = str.find_last_not_of(" \t\n\r");
+    return str.substr(first, (last - first + 1));
+}
+
+// --- 0. Самописный динамический массив строк (замена std::vector<std::string>) ---
+class DynamicStringArray {
+private:
+    std::string* data;
+    size_t capacity;
+    size_t size;
+
+    void resize(size_t new_capacity) {
+        if (new_capacity <= capacity) return;
+        
+        std::string* new_data = new std::string[new_capacity];
+        for (size_t i = 0; i < size; ++i) {
+            new_data[i] = data[i]; 
+        }
+
+        delete[] data;
+        data = new_data;
+        capacity = new_capacity;
+    }
+
+public:
+    DynamicStringArray(size_t initial_capacity = 10) 
+        : capacity(initial_capacity), size(0) {
+        if (capacity == 0) capacity = 1;
+        data = new std::string[capacity];
+    }
+
+    ~DynamicStringArray() {
+        delete[] data;
+    }
+
+    void push_back(const std::string& value) {
+        if (size == capacity) {
+            resize(capacity * 2);
+        }
+        data[size++] = value;
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+    std::string& operator[](size_t index) const {
+        return data[index];
+    }
+};
+
+
+// --- 1. Структура для хранимых данных (имитация JSON-документа) ---
+struct Document {
+    std::string name;
+    int age;
+    std::string city;
+    std::string _id; 
+
+    Document(const std::string& n, int a, const std::string& c, const std::string& id)
+        : name(n), age(a), city(c), _id(id) {}
+
+    Document(const Document&) = delete;
+    Document& operator=(const Document&) = delete;
+
+    std::string serialize() const {
+        return "{\"_id\":\"" + _id + "\",\"name\":\"" + name + "\",\"age\":" + std::to_string(age) + ",\"city\":\"" + city + "\"}";
+    }
+
+    // Вспомогательная функция для извлечения значения поля из JSON-строки
+    static std::string extract_value(const std::string& json_line, const std::string& key, bool is_string) {
+        std::string search_key = "\"" + key + "\":";
+        size_t pos = json_line.find(search_key);
+        if (pos == std::string::npos) {
+            throw std::runtime_error("Field key not found: " + key);
+        }
+
+        size_t start_search = pos + search_key.length();
+        size_t start_val = json_line.find_first_not_of(" \t", start_search);
+
+        if (start_val == std::string::npos) {
+            throw std::runtime_error("Value for field " + key + " is empty.");
+        }
+
+        if (is_string) {
+            if (json_line[start_val] != '"') {
+                throw std::runtime_error("Value for field " + key + " is not properly quoted.");
+            }
+            size_t start_content = start_val + 1;
+            size_t end_content = json_line.find('"', start_content);
+            
+            if (end_content == std::string::npos) {
+                throw std::runtime_error("Mismatched closing quote for field: " + key);
+            }
+            return json_line.substr(start_content, end_content - start_content);
+        } else { // Число
+            size_t end_val = json_line.find_first_of(",}", start_val); 
+            if (end_val == std::string::npos) {
+                throw std::runtime_error("Invalid number boundary for field: " + key);
+            }
+            return trim(json_line.substr(start_val, end_val - start_val));
+        }
+    }
+
+    // Статический метод для "десериализации" (упрощенный ручной парсинг)
+    static Document* deserialize(const std::string& json_line) {
+        if (json_line.empty()) return nullptr;
+
+        try {
+            std::string id_str = trim(extract_value(json_line, "_id", true));
+            std::string name = extract_value(json_line, "name", true);
+            std::string city = extract_value(json_line, "city", true);
+            std::string age_str = extract_value(json_line, "age", false);
+            
+            int age = std::stoi(age_str);
+
+            return new Document(name, age, city, id_str);
+        } catch (const std::runtime_error& e) {
+            std::cerr << "ERROR: Failed to deserialize document: " << json_line << " (Details: " << e.what() << ")" << std::endl;
+            return nullptr;
+        } catch (...) {
+            std::cerr << "ERROR: Failed to deserialize document (unknown error): " << json_line << std::endl;
+            return nullptr;
+        }
+    }
+};
+
+// --- 2. Структура узла для цепочки (метод цепочек) ---
+struct ListNode {
+    std::string key;    
+    Document* value;    
+    ListNode* next;
+
+    ListNode(const std::string& k, Document* v) : key(k), value(v), next(nullptr) {}
+};
+
+// --- 3. Класс CustomList (для бакетов) ---
+class CustomList {
+public:
+    ListNode* head;
+
+    CustomList() : head(nullptr) {}
+
+    // Деструктор очищает только узлы списка, не значения Document
+    ~CustomList() {
+        ListNode* current = head;
+        while (current) {
+            ListNode* next = current->next;
+            // НЕ удаляем current->value, это делает CustomHashMap
+            delete current; 
+            current = next;
+        }
+    }
+
+    ListNode* find(const std::string& key) const {
+        ListNode* current = head;
+        while (current) {
+            if (current->key == key) { 
+                return current;
+            }
+            current = current->next;
+        }
+        return nullptr;
+    }
+
+    Document* remove(const std::string& key) {
+        ListNode* current = head;
+        ListNode* prev = nullptr;
+
+        while (current) {
+            if (current->key == key) {
+                if (prev) {
+                    prev->next = current->next;
+                } else {
+                    head = current->next;
+                }
+
+                Document* removed_value = current->value;
+                current->value = nullptr; // Узел больше не владеет документом
+                delete current;          
+                return removed_value;    
+            }
+            prev = current;
+            current = current->next;
+        }
+        return nullptr; 
+    }
+};
+
+// --- 4. Класс CustomHashMap ---
+class CustomHashMap {
+private:
+    static const size_t DEFAULT_CAPACITY = 16;
+    static constexpr float LOAD_FACTOR_THRESHOLD = 0.75f;
+
+    CustomList* buckets;  
+    size_t capacity;      
+    size_t size;          
+
+    size_t _hash(const std::string& key) const {
+        size_t hash_value = 0;
+        unsigned int prime = 31;
+        for (char c : key) { 
+            hash_value = hash_value * prime + (unsigned char)c;
+        }
+        return hash_value % capacity;
+    }
+
+    void _resize_and_rehash() {
+        size_t old_capacity = capacity;
+        CustomList* old_buckets = buckets;
+
+        capacity *= 2;
+        size = 0; 
+        buckets = new CustomList[capacity];
+
+        std::cout << "--- INFO: Расширение HashMap. Новая емкость: " << capacity << " ---" << std::endl;
+
+        for (size_t i = 0; i < old_capacity; ++i) {
+            ListNode* current = old_buckets[i].head;
+            while (current) {
+                // Вставка без удаления старого значения, так как мы перемещаем владение
+                put(current->key, current->value, false); 
+                current->value = nullptr; // Сброс владения
+                current = current->next;
+            }
+        }
+
+        delete[] old_buckets; // Деструктор CustomList очистит узлы
+    }
+
+public:
+    CustomHashMap(size_t initial_capacity = DEFAULT_CAPACITY)
+        : capacity(initial_capacity > 0 ? initial_capacity : DEFAULT_CAPACITY), size(0) {
+        buckets = new CustomList[capacity];
+    }
+
+    // Деструктор очищает все документы, хранящиеся в HashMap
+    ~CustomHashMap() {
+        for (size_t i = 0; i < capacity; ++i) {
+            ListNode* current = buckets[i].head;
+            while (current) {
+                delete current->value; // Удаляем сам документ
+                current = current->next;
+            }
+        }
+        delete[] buckets; // Деструктор CustomList очистит узлы
+    }
+
+    void put(const std::string& key, Document* value, bool delete_on_update = true) {
+        if (float(size) / capacity >= LOAD_FACTOR_THRESHOLD) {
+            _resize_and_rehash();
+        }
+
+        size_t index = _hash(key);
+        std::string cleaned_key = trim(key); 
+        ListNode* existing_node = buckets[index].find(cleaned_key);
+
+        if (existing_node) {
+            if (delete_on_update) {
+                delete existing_node->value; // Удаляем старый документ
+            }
+            existing_node->value = value; // Присваиваем новый
+        } else {
+            ListNode* new_node = new ListNode(cleaned_key, value);
+            new_node->next = buckets[index].head; 
+            buckets[index].head = new_node;
+            size++;
+        }
+    }
+
+    Document* get(const std::string& key) const {
+        size_t index = _hash(key);
+        ListNode* node = buckets[index].find(trim(key));
+        return node ? node->value : nullptr;
+    }
+
+    Document* remove(const std::string& key) {
+        size_t index = _hash(key);
+
+        Document* removed_value = buckets[index].remove(trim(key));
+        if (removed_value) {
+            size--;
+        }
+        // Возвращаем удаленное значение, чтобы вызывающая сторона могла его очистить (handle_delete)
+        return removed_value; 
+    }
+
+    size_t getSize() const { return size; }
+    size_t getCapacity() const { return capacity; }
+    
+    // Метод для итерации (обход всех бакетов)
+    ListNode* getBucketHead(size_t index) const {
+        if (index < capacity) {
+            return buckets[index].head;
+        }
+        return nullptr;
+    }
+};
+
+
+// --- 5. Класс MiniDBMS (Интеграция) ---
+class MiniDBMS {
+private:
+    std::string db_name;
+    CustomHashMap data_store;
+    long long next_id = 1; 
+
+    std::string generate_id() {
+        return std::to_string(next_id++); 
+    }
+    
+    fs::path get_collection_path() const {
+        return fs::path(db_name + ".json");
+    }
+
+    /**
+     * @brief Загрузка всех документов из файла коллекции в CustomHashMap.
+     */
+    void load() {
+        fs::path path = get_collection_path();
+        if (!fs::exists(path)) {
+            std::cout << "INFO: Collection file not found. Starting with empty database." << std::endl;
+            next_id = 1; 
+            return;
+        }
+
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            std::cerr << "ERROR: Could not open collection file for reading." << std::endl;
+            return;
+        }
+
+        std::string line;
+        long long max_id = 0;
+        
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            
+            Document* doc = Document::deserialize(line);
+            if (doc) {
+                data_store.put(doc->_id, doc); 
+                
+                try {
+                    long long current_id = std::stoll(doc->_id);
+                    if (current_id > max_id) {
+                        max_id = current_id;
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "WARNING: Could not parse ID '" << doc->_id << "' to integer during load. " << e.what() << std::endl;
+                }
+            }
+        }
+        file.close();
+        next_id = max_id + 1; 
+        std::cout << "INFO: Database loaded. Documents: " << data_store.getSize() << ". Next ID: " << next_id << std::endl;
+    }
+
+    /**
+     * @brief Сохранение всех документов из CustomHashMap в файл коллекции.
+     */
+    void save() const {
+        fs::path path = get_collection_path();
+        std::ofstream file(path); 
+        if (!file.is_open()) {
+            std::cerr << "ERROR: Could not open collection file for writing." << std::endl;
+            return;
+        }
+
+        size_t count = 0;
+        for (size_t i = 0; i < data_store.getCapacity(); ++i) {
+            ListNode* current = data_store.getBucketHead(i);
+            while (current) {
+                file << current->value->serialize() << "\n";
+                current = current->next;
+                count++;
+            }
+        }
+
+        file.close();
+        std::cout << "INFO: Database saved successfully. Documents: " << count << ". File: " << path.string() << std::endl;
+    }
+
+    // --- Вспомогательные функции для парсинга запросов Find ---
+
+    std::string find_string_value(const std::string& json_str, const std::string& field_name) {
+        return Document::extract_value(json_str, field_name, true);
+    }
+
+    int find_int_value(const std::string& json_str, const std::string& field_name) {
+        std::string num_str = Document::extract_value(json_str, field_name, false);
+        try {
+            return std::stoi(num_str);
+        } catch (...) {
+            throw std::runtime_error("Value is not a valid integer for field: " + field_name);
+        }
+    }
+    
+    /**
+     * @brief Проверяет, соответствует ли значение документа условию запроса (явный $eq или операторы $gt, $lt, $in).
+     */
+    bool match_query_value(const std::string& doc_value_raw, const std::string& query_value_obj, const std::string& field_type) {
+        std::string doc_value = trim(doc_value_raw); 
+        std::string trimmed_query = trim(query_value_obj);
+
+        if (trimmed_query.empty()) return false;
+
+        if (trimmed_query.front() != '{') { 
+            // 1. Простой $eq (неявное равенство)
+            
+            // Снятие кавычек для строковых значений в запросе
+            if (trimmed_query.length() >= 2 && trimmed_query.front() == '"' && trimmed_query.back() == '"') {
+                trimmed_query = trimmed_query.substr(1, trimmed_query.length() - 2);
+            }
+            // Дополнительная очистка запроса после снятия кавычек
+            trimmed_query = trim(trimmed_query);
+            
+            if (field_type == "age") {
+                try {
+                    return std::stoi(doc_value) == std::stoi(trimmed_query);
+                } catch (...) {
+                    return false;
+                }
+            }
+            // Сравнение строк
+            return doc_value == trimmed_query;
+        }
+
+        // 2. Сложные операторы ($gt, $lt, $in)
+        
+        auto extract_operator_value = [&](const std::string& op_key, bool is_string) -> std::string {
+            std::string op_search = "\"" + op_key + "\":";
+            size_t pos = trimmed_query.find(op_search);
+            if (pos == std::string::npos) return ""; 
+
+            size_t start_search = pos + op_search.length();
+            size_t start_val = trimmed_query.find_first_not_of(" \t", start_search);
+            if (start_val == std::string::npos) return "";
+
+            if (is_string) {
+                if (trimmed_query[start_val] != '"') return "";
+                size_t start_content = start_val + 1;
+                size_t end_content = trimmed_query.find('"', start_content);
+                if (end_content == std::string::npos) return "";
+                return trim(trimmed_query.substr(start_content, end_content - start_content)); 
+            } else { 
+                size_t end_val = trimmed_query.find_first_of(",}", start_val); 
+                if (end_val == std::string::npos) return "";
+                return trim(trimmed_query.substr(start_val, end_val - start_val));
+            }
+        };
+
+        // --- $gt (Greater Than) ---
+        std::string gt_val_str = extract_operator_value("$gt", field_type != "age"); 
+        if (!gt_val_str.empty()) {
+            if (field_type == "age") {
+                return std::stoi(doc_value) > std::stoi(gt_val_str);
+            } else {
+                return doc_value > gt_val_str;
+            }
+        }
+        
+        // --- $lt (Less Than) ---
+        std::string lt_val_str = extract_operator_value("$lt", field_type != "age");
+        if (!lt_val_str.empty()) {
+            if (field_type == "age") {
+                return std::stoi(doc_value) < std::stoi(lt_val_str);
+            } else {
+                return doc_value < lt_val_str;
+            }
+        }
+        
+        // --- $in (In Array) ---
+        std::string in_search = "\"$in\":";
+        size_t in_pos = trimmed_query.find(in_search);
+        if (in_pos != std::string::npos) {
+            size_t array_start = trimmed_query.find('[', in_pos + in_search.length());
+            if (array_start == std::string::npos) return false;
+
+            size_t array_end = trimmed_query.find(']', array_start);
+            if (array_end == std::string::npos) return false;
+            
+            std::string array_content = trimmed_query.substr(array_start + 1, array_end - array_start - 1);
+            std::stringstream ss(array_content);
+            std::string item;
+            
+            while (std::getline(ss, item, ',')) {
+                std::string trimmed_item = trim(item);
+                // Снятие кавычек
+                if (trimmed_item.length() >= 2 && trimmed_item.front() == '"' && trimmed_item.back() == '"') {
+                    trimmed_item = trimmed_item.substr(1, trimmed_item.length() - 2);
+                }
+                trimmed_item = trim(trimmed_item); 
+                
+                if (doc_value == trimmed_item) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        return false;
+    }
+
+    /**
+     * @brief Проверяет, соответствует ли документ всем условиям AND (неявный логический AND).
+     * query_json должен быть объектом с условиями, например: {"name": "Alice", "age": 25}
+     */
+    bool match_and_query(const Document* doc, const std::string& query_json) {
+        std::string query = trim(query_json);
+        if (query.empty() || query == "{}") return true;
+
+        // Удаление внешних фигурных скобок
+        std::string content = query.substr(1, query.length() - 2); 
+        size_t current_pos = 0;
+        
+        while (current_pos < content.length()) {
+            // Пропуск разделителей и пробелов
+            while (current_pos < content.length() && (content[current_pos] == ' ' || content[current_pos] == '\t' || content[current_pos] == ',')) {
+                current_pos++;
+            }
+            if (current_pos >= content.length()) break; 
+            
+            // Парсинг имени поля
+            size_t start_key = content.find('"', current_pos);
+            if (start_key == std::string::npos) break; 
+            size_t end_key = content.find('"', start_key + 1);
+            if (end_key == std::string::npos) return false; 
+            std::string field_name = content.substr(start_key + 1, end_key - start_key - 1);
+
+            // Поиск начала значения условия
+            size_t start_val_search = content.find(':', end_key);
+            if (start_val_search == std::string::npos) return false;
+            size_t val_start_char = content.find_first_not_of(" \t", start_val_search + 1);
+            if (val_start_char == std::string::npos) return false; 
+
+            // Определение конца значения условия (сложная логика)
+            size_t end_val = std::string::npos;
+            bool is_number = false; 
+
+            char first_char = content[val_start_char];
+            
+            if (first_char == '{' || first_char == '[') { 
+                // Условие с оператором ($gt, $lt, $in) или вложенный объект/массив
+                char open_char = first_char;
+                char close_char = (open_char == '{') ? '}' : ']';
+                
+                int bracket_count = 0;
+                end_val = val_start_char;
+                while (end_val < content.length()) {
+                    if (content[end_val] == open_char) bracket_count++;
+                    if (content[end_val] == close_char) {
+                        bracket_count--;
+                        if (bracket_count == 0) break; 
+                    }
+                    end_val++;
+                }
+                if (bracket_count != 0 || end_val >= content.length()) return false;
+                
+            } else if (first_char == '"') {
+                // Строковое значение
+                size_t temp_pos = val_start_char;
+                do {
+                    temp_pos = content.find('"', temp_pos + 1);
+                    if (temp_pos == std::string::npos) return false; 
+                    if (temp_pos == 0 || content[temp_pos - 1] != '\\') {
+                         end_val = temp_pos;
+                         break;
+                    }
+                } while(temp_pos != std::string::npos);
+
+                if (temp_pos == std::string::npos) return false; 
+                
+            } else {
+                // Числовое значение
+                size_t separator_pos = content.find_first_of(",}", val_start_char);
+                size_t boundary = (separator_pos == std::string::npos) ? content.length() : separator_pos;
+                end_val = content.find_last_not_of(" \t", boundary - 1);
+                
+                if (end_val == std::string::npos || end_val < val_start_char) return false;
+                
+                is_number = true; 
+            }
+
+            size_t length = end_val - val_start_char + 1;
+            std::string condition_value = content.substr(val_start_char, length);
+            
+            std::string doc_value_raw;
+            std::string field_type;
+
+            // Извлечение значения из документа
+            if (field_name == "name") { doc_value_raw = doc->name; field_type = "name"; }
+            else if (field_name == "age") { doc_value_raw = std::to_string(doc->age); field_type = "age"; }
+            else if (field_name == "city") { doc_value_raw = doc->city; field_type = "city"; }
+            else if (field_name == "_id") { doc_value_raw = doc->_id; field_type = "_id"; }
+            else { 
+                // Неизвестное поле, пропускаем (но переходим к концу этого условия)
+                current_pos = is_number ? content.find_first_of(",}", end_val) : end_val + 1;
+                if (current_pos == std::string::npos) current_pos = content.length();
+                continue; 
+            }
+
+            // Проверка соответствия (логический AND)
+            if (!match_query_value(doc_value_raw, condition_value, field_type)) {
+                return false; 
+            }
+            
+            // Обновление текущей позиции для парсинга следующего поля
+            if (is_number) {
+                current_pos = content.find_first_of(",}", end_val + 1);
+                if (current_pos == std::string::npos) current_pos = content.length();
+            } else {
+                current_pos = end_val + 1;
+            }
+        }
+
+        return true; 
+    }
+
+    /**
+     * @brief Обрабатывает логический оператор $or.
+     * Ожидаемый формат: {"$or": [ {condition1}, {condition2} ]}
+     */
+    bool handle_or_query(const Document* doc, const std::string& query_json) {
+        std::string search_key = "\"$or\":";
+        size_t pos = query_json.find(search_key);
+        if (pos == std::string::npos) return false; 
+        
+        // Находим начало и конец массива условий
+        size_t array_start = query_json.find('[', pos + search_key.length());
+        if (array_start == std::string::npos) return false;
+        
+        size_t array_end = query_json.find_last_of(']');
+        if (array_end == std::string::npos || array_end < array_start) return false;
+        
+        std::string array_content = query_json.substr(array_start + 1, array_end - array_start - 1);
+        
+        int bracket_count = 0;
+        size_t current_pos = 0;
+        
+        while (current_pos < array_content.length()) {
+            size_t start_cond = array_content.find('{', current_pos);
+            if (start_cond == std::string::npos) break;
+            
+            size_t end_cond = start_cond;
+            bracket_count = 0;
+            bool found_end = false;
+
+            // Находим конец текущего объекта условия
+            while (end_cond < array_content.length()) {
+                if (array_content[end_cond] == '{') bracket_count++;
+                if (array_content[end_cond] == '}') {
+                    bracket_count--;
+                    if (bracket_count == 0) {
+                        found_end = true;
+                        break; 
+                    }
+                }
+                end_cond++;
+            }
+            
+            if (!found_end) return false; 
+            
+            std::string sub_query = array_content.substr(start_cond, end_cond - start_cond + 1);
+            
+            // Каждое подусловие внутри $or - это неявный AND
+            if (match_and_query(doc, trim(sub_query))) {
+                return true; // OR success: одно условие совпало
+            }
+            
+            current_pos = end_cond + 1;
+        }
+
+        return false; // OR failure: ни одно условие не совпало
+    }
+
+    /**
+     * @brief Главная функция проверки соответствия документа запросу.
+     */
+    bool match_document(const Document* doc, const std::string& query_json) {
+        std::string query = trim(query_json);
+        if (query.empty() || query == "{}") return true;
+
+        // 1. Проверяем на top-level оператор $or (должен быть в начале запроса)
+        // Ищем "$or" и убеждаемся, что он идет перед первым открывающим полем.
+        if (query.find("\"$or\"") != std::string::npos && query.find("\"$or\"") < query.find_first_of("\"", 2)) {
+            return handle_or_query(doc, query);
+        }
+
+        // 2. По умолчанию - implicit AND
+        return match_and_query(doc, query);
+    }
+
+
+    void handle_insert(const std::string& query_json) {
+        std::string name, city;
+        int age = 0;
+        
+        try {
+            name = find_string_value(query_json, "name");
+            age = find_int_value(query_json, "age");
+            city = find_string_value(query_json, "city");
+
+        } catch (const std::runtime_error& e) {
+            std::cerr << "ERROR: Invalid insert query format or missing fields. Details: " << e.what() << std::endl;
+            return;
+        } catch (...) {
+            std::cerr << "ERROR: Invalid insert query format or missing fields (unknown parsing error)." << std::endl;
+            return;
+        }
+
+        std::string new_id = generate_id();
+        Document* new_doc = new Document(name, age, city, new_id);
+
+        data_store.put(new_doc->_id, new_doc);
+        
+        std::cout << "SUCCESS: Document inserted successfully. ID: " << new_id << ". In-memory size: " << data_store.getSize() << std::endl;
+    }
+    
+    void handle_find(const std::string& query_json) {
+        size_t found_count = 0;
+        std::cout << "INFO: Starting query: " << query_json << std::endl;
+
+        // Полное сканирование коллекции (Full Table Scan)
+        for (size_t i = 0; i < data_store.getCapacity(); ++i) {
+            ListNode* current = data_store.getBucketHead(i);
+            while (current) {
+                if (match_document(current->value, query_json)) { // Используем match_document
+                    std::cout << "-> " << current->value->serialize() << std::endl;
+                    found_count++;
+                }
+                current = current->next;
+            }
+        }
+
+        std::cout << "SUCCESS: Found " << found_count << " document(s)." << std::endl;
+    }
+
+    void handle_delete(const std::string& query_json) {
+        size_t deleted_count = 0;
+        std::cout << "INFO: Starting delete query: " << query_json << std::endl;
+        
+        DynamicStringArray ids_to_delete;
+
+        for (size_t i = 0; i < data_store.getCapacity(); ++i) {
+            ListNode* current = data_store.getBucketHead(i);
+            while (current) {
+                if (match_document(current->value, query_json)) { // Используем match_document
+                    ids_to_delete.push_back(current->key); 
+                }
+                current = current->next;
+            }
+        }
+
+        // Выполняем удаление
+        for (size_t i = 0; i < ids_to_delete.getSize(); ++i) {
+            std::string id = ids_to_delete[i];
+            Document* removed_doc = data_store.remove(id);
+            if (removed_doc) {
+                delete removed_doc; // Очищаем память удаленного документа
+                deleted_count++;
+            }
+        }
+
+        std::cout << "SUCCESS: Deleted " << deleted_count << " document(s)." << std::endl;
+    }
+
+
+public:
+    MiniDBMS(const std::string& db_name) : db_name(db_name) {}
+    
+    ~MiniDBMS() = default; 
+
+    void run(const std::string& command, const std::string& query_json) {
+        load();
+        
+        if (command == "insert") {
+            handle_insert(query_json);
+        } else if (command == "find") {
+            handle_find(query_json);
+        } else if (command == "delete") { 
+            handle_delete(query_json);
+        } else {
+            std::cerr << "ERROR: Unknown command: " << command << std::endl;
+        }
+
+        save();
+    }
+};
+
+// --- ОСНОВНАЯ ФУНКЦИЯ (АРГУМЕНТЫ КОМАНДНОЙ СТРОКИ) ---
+
+int main(int argc, char* argv[]) {
+    if (argc < 4) {
+        std::cerr << "Usage: ./no_sql_dbms <db_name> <command> '<query_json>'" << std::endl;
+        std::cerr << "Commands supported:" << std::endl;
+        std::cerr << "  insert: <query_json>" << std::endl;
+        std::cerr << "  find: <query_json>" << std::endl;
+        std::cerr << "  delete: <query_json>" << std::endl;
+        std::cerr << "Example: ./no_sql_dbms my_database insert '{\"name\": \"Alice\", \"age\": 25, \"city\": \"London\"}'" << std::endl;
+        std::cerr << "Example: ./no_sql_dbms my_database find '{\"age\": {\"$gt\": 20, \"$lt\": 30}}'" << std::endl;
+        return 1;
+    }
+
+    std::string db_name = argv[1];
+    std::string command = argv[2];
+    std::string query_json = argv[3];
+
+    // Удаление внешних кавычек (если есть)
+    if (query_json.length() >= 2 && query_json.front() == '\'' && query_json.back() == '\'') {
+        query_json = query_json.substr(1, query_json.length() - 2);
+    }
+    
+    MiniDBMS dbms(db_name);
+    dbms.run(command, query_json);
+
+    return 0;
+}
